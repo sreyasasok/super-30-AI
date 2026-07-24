@@ -1,3 +1,4 @@
+import json
 import os
 from typing import List, Literal, Optional
 
@@ -9,10 +10,15 @@ from pydantic import BaseModel, Field
 from api.errors import ApiError
 from config import settings
 from core.logging import get_logger
-from services.vector_db import drill_collection, baseline_collection
+from services.vector_db import drill_collection, baseline_collection, coach_preference_collection
 from tasks.cv_engine import (
     DIRECTIONAL_PROFILES,
+    PROFILE_RELEVANT_LANDMARKS,
     TRACKING_PROFILE_FRIENDLY_NAMES,
+    apply_landmark_corrections,
+    detect_landmarks,
+    extract_named_landmarks,
+    compute_metric_from_landmarks,
     find_peak_motion_frame,
     get_directional_label,
     get_player_adjustment_label,
@@ -68,6 +74,55 @@ class DrillRecommendationRequest(BaseModel):
     fault_tag: str
     combined_search_text: str = Field(min_length=1)
     limit: int = Field(default=3, ge=1, le=10, description="Number of top matching drills to return")
+    coach_id: Optional[str] = Field(
+        default=None,
+        description="If provided, boosts a drill this coach has previously picked for a similar "
+        "flaw note (logged via /drill-recommendation-feedback) to the top of the results.",
+    )
+
+
+LANDMARK_NAMES = Literal[
+    "NOSE", "LEFT_SHOULDER", "RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST",
+    "LEFT_HIP", "RIGHT_HIP", "RIGHT_KNEE", "LEFT_ANKLE", "RIGHT_ANKLE",
+]
+
+
+class PoseLandmarksRequest(BaseModel):
+    video_path: str = Field(min_length=1)
+    tracking_profile: Optional[TRACKING_PROFILES] = Field(
+        default=None,
+        description="If given, only the joints that profile's metric reads are returned. "
+        "Omit to get all 10 tracked joints.",
+    )
+
+
+class LandmarkCorrection(BaseModel):
+    landmark_name: LANDMARK_NAMES
+    x: float = Field(description="Normalized x in [0, 1], same image-coordinate convention MediaPipe returns.")
+    y: float = Field(description="Normalized y in [0, 1], origin top-left, increasing downward.")
+
+
+class PoseCorrectionRequest(BaseModel):
+    video_path: str = Field(min_length=1)
+    tracking_profile: TRACKING_PROFILES
+    corrections: List[LandmarkCorrection] = Field(min_length=1, description="One or more joints the coach dragged into a corrected position.")
+    purpose: Literal["BASELINE", "ROOT_CAUSE"] = Field(
+        description="BASELINE: the corrected_value is meant to be registered as a Fixed Reference "
+        "Baseline. ROOT_CAUSE: generates a narrative linking the correction to note_context."
+    )
+    note_context: Optional[str] = Field(
+        default=None,
+        description="The coach's symptom note (e.g. 'playing away from body'). Only used, and only "
+        "produces a root_cause_summary, when purpose=ROOT_CAUSE.",
+    )
+
+
+class DrillRecommendationFeedbackRequest(BaseModel):
+    note_id: str = Field(min_length=1)
+    coach_id: str = Field(min_length=1)
+    combined_search_text: str = Field(min_length=1, description="Same text that was queried for suggestions.")
+    suggested_drill_ids: List[str] = Field(default_factory=list, description="What the AI proposed at the time.")
+    selected_drill_id: str = Field(min_length=1, description="What the coach actually attached.")
 
 
 class RegressionCheckRequest(BaseModel):
@@ -123,6 +178,114 @@ def _format_drill_matches(ids: list, distances: list, metadatas: list, limit: in
                 }
             )
     return matches
+
+
+
+# How many of a coach's past feedback entries to pull back when looking for their preference
+# on a similar issue. Deliberately > 1: this is what makes the boost reflect what a coach
+# actually prefers for a kind of issue (their most-frequently-chosen drill among similar past
+# notes), rather than a coin-flip on which single past note happens to be worded closest to
+# the new one.
+COACH_PREFERENCE_LOOKBACK = 15
+
+
+def _apply_personalization_boost(
+    coach_id: Optional[str], combined_search_text: str, matches: list, limit: int
+) -> list:
+    """Boosts the drill a coach most often picks for issues similar to this one (logged via
+    /drill-recommendation-feedback) to the front of `matches`. Shared by the single and batch
+    recommendation endpoints, same rationale as _format_drill_matches.
+
+    Pulls back the coach's COACH_PREFERENCE_LOOKBACK most similar past feedback entries, keeps
+    only the ones that clear DRILL_SIMILARITY_CUTOFF (so a loosely-related past note can't
+    count toward "what they prefer for this issue"), and picks whichever drill appears most
+    often among those — not just whichever single past note is worded closest to the new one.
+    Ties broken by highest similarity.
+
+    Gated two ways so a coach's history can't misfire on an unrelated flaw:
+    1. Text similarity against DRILL_SIMILARITY_CUTOFF on every counted instance (same
+       constant standard matching uses).
+    2. Category safety gate: the boosted drill only leads the list if its category matches
+       the top standard match's category (or either is unset/GENERAL) — otherwise it's still
+       appended (marked personalized) rather than discarded, but doesn't override a
+       topically-stronger standard result.
+    """
+    if not coach_id or coach_preference_collection.count() == 0:
+        return matches
+
+    try:
+        results = coach_preference_collection.query(
+            query_texts=[combined_search_text],
+            n_results=min(COACH_PREFERENCE_LOOKBACK, coach_preference_collection.count()),
+            where={"coach_id": coach_id},
+        )
+    except Exception as exc:
+        logger.error("Personalization lookup failed | coach_id=%s error=%s", coach_id, exc)
+        return matches
+
+    ids = results["ids"][0] if results["ids"] else []
+    if not ids:
+        return matches
+
+    distances = results["distances"][0] if results["distances"] else [1.0] * len(ids)
+    metadatas = results["metadatas"][0] if results["metadatas"] else [{}] * len(ids)
+
+    # Only past instances that are themselves a strong match for the CURRENT issue count
+    # toward "what this coach prefers for this kind of issue" — a coach's pick for an
+    # unrelated flaw shouldn't pollute the tally just because it's in their history.
+    pick_counts: dict[str, int] = {}
+    best_similarity: dict[str, float] = {}
+    for distance, metadata in zip(distances, metadatas):
+        similarity = max(0.0, round(1 - distance, 2))
+        if similarity < settings.DRILL_SIMILARITY_CUTOFF:
+            continue
+        drill_id = metadata.get("selected_drill_id")
+        if not drill_id:
+            continue
+        pick_counts[drill_id] = pick_counts.get(drill_id, 0) + 1
+        best_similarity[drill_id] = max(best_similarity.get(drill_id, 0.0), similarity)
+
+    if not pick_counts:
+        return matches
+
+    # Most-frequently-picked drill wins; ties broken by whichever was textually closest.
+    max_count = max(pick_counts.values())
+    tied_drill_ids = [d for d, c in pick_counts.items() if c == max_count]
+    preferred_drill_id = max(tied_drill_ids, key=lambda d: best_similarity[d])
+    similarity = best_similarity[preferred_drill_id]
+    times_preferred = pick_counts[preferred_drill_id]
+
+    try:
+        drill_lookup = drill_collection.get(ids=[preferred_drill_id])
+    except Exception as exc:
+        logger.error("Preferred drill lookup failed | drill_id=%s error=%s", preferred_drill_id, exc)
+        return matches
+
+    if not drill_lookup["ids"]:
+        # Coach's previously-picked drill has since been deleted from the library.
+        return matches
+
+    drill_meta = drill_lookup["metadatas"][0]
+    boosted = {
+        "drill_id": preferred_drill_id,
+        "name": drill_meta.get("name", "Unknown Drill"),
+        "category": drill_meta.get("category"),
+        "similarity_score": similarity,
+        "personalized": True,
+        "times_previously_selected": times_preferred,
+    }
+
+    top_category = matches[0]["category"] if matches else None
+    categories_compatible = (
+        not matches
+        or not boosted["category"] or boosted["category"] == "GENERAL"
+        or not top_category or top_category == "GENERAL"
+        or boosted["category"] == top_category
+    )
+
+    deduped = [m for m in matches if m["drill_id"] != preferred_drill_id]
+    result = [boosted] + deduped if categories_compatible else deduped + [boosted]
+    return result[:limit]
 
 
 def _read_peak_frame_or_error(video_path: str):
@@ -204,10 +367,17 @@ def _generate_regression_insight(
         )
     else:
         metric_line = (
-            f"Metric: {tracking_profile} ({friendly_name}). Baseline value: {baseline_value:.2f}. "
-            f"Current value: {current_value:.2f}. Deviation: {deviation_percentage:.1f}%."
+            f"Metric: {tracking_profile} ({friendly_name}) — NOT a directional metric. "
+            f"Baseline value: {baseline_value:.2f}. Current value: {current_value:.2f}. "
+            f"Deviation: {deviation_percentage:.1f}%. Do NOT use the words 'high', 'low', 'left', or "
+            "'right' to describe this — describe the deviation only by its size/percentage."
         )
-        player_instruction = "Speak directly to the player about focusing on standard form for this metric."
+        player_instruction = (
+            "Speak directly to the player about focusing on standard form for this metric. "
+            "This is NOT a directional metric: do not use the literal tokens '{baseline_direction}', "
+            "'{current_direction}', or '{player_adjustment}' anywhere in either summary — write plain, "
+            "complete sentences with no placeholders."
+        )
 
     # Context about the returning habit
     resolved_clause = f"which was marked as fixed on {resolved_at}" if resolved_at else "which was previously marked as fixed"
@@ -220,7 +390,8 @@ def _generate_regression_insight(
 
     try:
         response = openai_client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
+            model=settings.OPENAI_MODEL,
+            reasoning_effort=settings.OPENAI_REASONING_EFFORT,
             response_format=RegressionInsightSchema,
             messages=[
                 {
@@ -231,11 +402,14 @@ def _generate_regression_insight(
                         f"{habit_context}\n"
                         f"Original coach note context: '{original_note_text or 'None'}'.\n"
                         "1) coach_summary: one precise sentence for a coach, referencing the metric name, "
-                        "the percentage, and explicitly warning that the resolved habit is returning. IMPORTANT: "
-                        "If this is a directional metric, you MUST use the literal tokens '{baseline_direction}' and "
-                        "'{current_direction}' in your sentence where the direction words belong (e.g., 'indicating the "
-                        "bowling arm was {baseline_direction} but has now become {current_direction}'). Do NOT write the "
-                        "direction words yourself.\n"
+                        "the percentage, and explicitly warning that the resolved habit is returning. The metric "
+                        "line above already tells you whether this is a directional metric or not — follow that, "
+                        "don't guess. IMPORTANT: ONLY if the metric line says this IS a directional metric, you "
+                        "MUST use the literal tokens '{baseline_direction}' and '{current_direction}' in your "
+                        "sentence where the direction words belong (e.g., 'indicating the bowling arm was "
+                        "{baseline_direction} but has now become {current_direction}'), and do NOT write the "
+                        "direction words yourself. If the metric line says this is NOT directional, never use "
+                        "those tokens at all — describe the deviation using only the percentage.\n"
                         "2) player_friendly_summary: one encouraging sentence a young player or their "
                         "parent can understand with no jargon, profile codes, or percentages — just what "
                         "resolved habit is slipping back, and what to work on. "
@@ -267,15 +441,79 @@ def _generate_regression_insight(
             else:
                 player_friendly_summary = f"{player_friendly_summary.rstrip('.')} (correction: {adjustment_label})."
         else:
-            # Strip any accidental template tokens from non-directional metrics
-            for token in ("{direction}", "{player_adjustment}", "{current_direction}", "{baseline_direction}"):
-                coach_summary = coach_summary.replace(token, "").replace("  ", " ")
-                player_friendly_summary = player_friendly_summary.replace(token, "").replace("  ", " ")
+            # A non-directional profile's summary should never contain a direction token — the
+            # prompt tells the model not to. If it ignores that anyway, naively stripping the
+            # token leaves a grammatically broken sentence (e.g. "...was previously  but has
+            # now become ,"). Rather than patch broken text, treat it as a malformed response
+            # and use the deterministic, always-grammatical fallback instead.
+            reserved_tokens = ("{direction}", "{player_adjustment}", "{current_direction}", "{baseline_direction}")
+            if any(token in coach_summary or token in player_friendly_summary for token in reserved_tokens):
+                logger.warning(
+                    "Non-directional regression insight leaked a direction token, using fallback | profile=%s",
+                    tracking_profile,
+                )
+                return fallback_coach, fallback_player
 
         return coach_summary, player_friendly_summary
     except Exception as exc:
         logger.error("OpenAI regression insight call failed | error=%s", exc)
         return fallback_coach, fallback_player
+
+
+class RootCauseInsightSchema(BaseModel):
+    root_cause_summary: str = Field(
+        description="One precise sentence linking the coach's manual joint correction to the "
+        "likely root cause of the symptom they described."
+    )
+
+
+def _generate_root_cause_summary(
+    tracking_profile: str,
+    original_value: float,
+    corrected_value: float,
+    deviation: float,
+    note_context: str,
+) -> str:
+    """Returns a one-sentence root-cause narrative linking a coach's manual landmark
+    correction (dragging a joint to where it should be) to the symptom they described.
+    Falls back to a grounded, numbers-only template — never invented text — if the LLM
+    call fails, matching the fallback rule every other insight helper in this file follows."""
+    friendly_name = TRACKING_PROFILE_FRIENDLY_NAMES.get(tracking_profile, tracking_profile)
+    fallback = (
+        f"Correcting {friendly_name} shifts the measurement from {original_value:.2f} to "
+        f"{corrected_value:.2f} ({deviation:+.2f}), consistent with the coach's note: '{note_context}'."
+    )
+    try:
+        response = openai_client.beta.chat.completions.parse(
+            model=settings.OPENAI_MODEL,
+            reasoning_effort=settings.OPENAI_REASONING_EFFORT,
+            response_format=RootCauseInsightSchema,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "A cricket coach manually corrected a player's joint position on a video "
+                        f"frame to demonstrate proper form for the metric '{tracking_profile}' "
+                        f"({friendly_name}). The AI's original measurement was {original_value:.2f}; "
+                        f"the coach's corrected position measures {corrected_value:.2f} "
+                        f"(a {deviation:+.2f} shift). The coach's note on the symptom they observed: "
+                        f"'{note_context}'.\n"
+                        "Write one precise sentence linking this symptom to the likely root cause "
+                        "implied by the correction — e.g. if the note describes a downstream effect "
+                        "(like playing away from the body), explain what the corrected joint position "
+                        "suggests is the actual mechanical cause."
+                    ),
+                }
+            ],
+            timeout=10.0,
+        )
+        parsed = response.choices[0].message.parsed
+        if parsed is None:
+            raise ValueError("root cause insight response had no parsed result")
+        return parsed.root_cause_summary
+    except Exception as exc:
+        logger.error("OpenAI root cause insight call failed | error=%s", exc)
+        return fallback
 
 
 @router.post("/video-analyses", status_code=status.HTTP_202_ACCEPTED)
@@ -292,6 +530,90 @@ async def analyze_video(payload: VideoAnalysisRequest):
         "status": 202,
         "message": "Success",
         "data": {"queued": True, "session_id": payload.session_id},
+    }
+
+
+@router.post("/frames/pose-landmarks")
+async def get_frame_pose_landmarks(payload: PoseLandmarksRequest):
+    """Returns the AI-detected joint positions for a video's peak-motion frame, so the coach
+    app can render them and let a coach drag one into a corrected position (see
+    /pose-corrections)."""
+    frame = _read_peak_frame_or_error(payload.video_path)
+    landmarks = extract_named_landmarks(frame)
+    if landmarks is None:
+        raise ApiError(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "UNPROCESSABLE_ENTITY",
+            "Could not detect pose landmarks in the video's action frame — try a clearer or closer clip.",
+        )
+
+    relevant = None
+    if payload.tracking_profile is not None:
+        relevant = PROFILE_RELEVANT_LANDMARKS[payload.tracking_profile]
+        landmarks = {name: landmarks[name] for name in relevant}
+
+    logger.info(
+        "Extracted pose landmarks | video_path=%s profile=%s count=%s",
+        payload.video_path, payload.tracking_profile, len(landmarks),
+    )
+
+    return {
+        "status": 200,
+        "message": "Success",
+        "data": {"landmarks": landmarks, "relevant_to_profile": relevant},
+    }
+
+
+@router.post("/pose-corrections")
+async def apply_pose_correction(payload: PoseCorrectionRequest):
+    """Recomputes a tracking profile's metric using a coach's manually corrected joint
+    position(s) instead of the AI's raw detection. purpose=BASELINE: the returned
+    corrected_value is meant to be passed straight to POST /players/{player_id}/baselines.
+    purpose=ROOT_CAUSE: pairs the correction with note_context to explain what the
+    correction implies about the underlying technical cause of a described symptom."""
+    frame = _read_peak_frame_or_error(payload.video_path)
+    landmarks = detect_landmarks(frame)
+    if landmarks is None:
+        raise ApiError(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "UNPROCESSABLE_ENTITY",
+            "Could not detect pose landmarks in the video's action frame — try a clearer or closer clip.",
+        )
+
+    original_value = compute_metric_from_landmarks(landmarks, payload.tracking_profile)
+    if original_value is None:
+        raise ApiError(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "UNPROCESSABLE_ENTITY",
+            f"Unable to compute a metric for profile {payload.tracking_profile}.",
+        )
+
+    corrections_map = {c.landmark_name: (c.x, c.y) for c in payload.corrections}
+    corrected_landmarks = apply_landmark_corrections(landmarks, corrections_map)
+    corrected_value = compute_metric_from_landmarks(corrected_landmarks, payload.tracking_profile)
+    deviation = corrected_value - original_value
+
+    root_cause_summary = None
+    if payload.purpose == "ROOT_CAUSE" and payload.note_context:
+        root_cause_summary = _generate_root_cause_summary(
+            payload.tracking_profile, original_value, corrected_value, deviation, payload.note_context
+        )
+
+    logger.info(
+        "Pose correction computed | video_path=%s profile=%s purpose=%s original=%.2f corrected=%.2f",
+        payload.video_path, payload.tracking_profile, payload.purpose, original_value, corrected_value,
+    )
+
+    return {
+        "status": 200,
+        "message": "Success",
+        "data": {
+            "tracking_profile": payload.tracking_profile,
+            "original_value": round(original_value, 2),
+            "corrected_value": round(corrected_value, 2),
+            "deviation_from_original": round(deviation, 2),
+            "root_cause_summary": root_cause_summary,
+        },
     }
 
 
@@ -323,6 +645,10 @@ async def recommend_drills(payload: DrillRecommendationRequest):
             results["metadatas"][0],
             payload.limit,
         )
+
+    formatted_drills = _apply_personalization_boost(
+        payload.coach_id, payload.combined_search_text, formatted_drills, payload.limit
+    )
 
     logger.info("Drill recommendations matched | note_id=%s count=%s", payload.note_id, len(formatted_drills))
 
@@ -362,7 +688,10 @@ async def recommend_drills_batch(payload: BatchDrillRecommendationRequest):
         ids = results["ids"][idx]
         distances = results["distances"][idx] if results["distances"] else [0.0] * len(ids)
         metadatas = results["metadatas"][idx]
-        batch_results[item.note_id] = _format_drill_matches(ids, distances, metadatas, item.limit)
+        matches = _format_drill_matches(ids, distances, metadatas, item.limit)
+        batch_results[item.note_id] = _apply_personalization_boost(
+            item.coach_id, item.combined_search_text, matches, item.limit
+        )
 
     logger.info("Batch drill recommendations matched | items=%s", len(payload.items))
 
@@ -370,6 +699,54 @@ async def recommend_drills_batch(payload: BatchDrillRecommendationRequest):
         "status": 200,
         "message": "Success",
         "data": {"results": batch_results},
+    }
+
+
+@router.post("/drill-recommendation-feedback", status_code=status.HTTP_201_CREATED)
+async def log_drill_recommendation_feedback(payload: DrillRecommendationFeedbackRequest):
+    """Logs whether a coach accepted an AI drill suggestion or overrode it with a manual
+    pick. This is the write side of the personalization loop that _apply_personalization_boost
+    reads from — the same note_id+coach_id logged twice overwrites (upsert), so re-finalizing
+    a draft note doesn't leave stale duplicate feedback behind."""
+    accepted = payload.selected_drill_id in payload.suggested_drill_ids
+    feedback_id = f"{payload.coach_id}_{payload.note_id}"
+    metadata = {
+        "coach_id": payload.coach_id,
+        "note_id": payload.note_id,
+        "suggested_drill_ids": json.dumps(payload.suggested_drill_ids),
+        "selected_drill_id": payload.selected_drill_id,
+        "accepted": accepted,
+    }
+
+    try:
+        coach_preference_collection.upsert(
+            ids=[feedback_id], documents=[payload.combined_search_text], metadatas=[metadata]
+        )
+    except Exception as exc:
+        logger.error(
+            "Drill recommendation feedback logging failed | coach_id=%s note_id=%s error=%s",
+            payload.coach_id, payload.note_id, exc,
+        )
+        raise ApiError(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "FEEDBACK_LOGGING_FAILED",
+            "An unexpected error occurred while logging drill recommendation feedback.",
+        )
+
+    logger.info(
+        "Logged drill recommendation feedback | coach_id=%s note_id=%s accepted=%s",
+        payload.coach_id, payload.note_id, accepted,
+    )
+
+    return {
+        "status": 201,
+        "message": "Success",
+        "data": {
+            "note_id": payload.note_id,
+            "coach_id": payload.coach_id,
+            "selected_drill_id": payload.selected_drill_id,
+            "accepted": accepted,
+        },
     }
 
 

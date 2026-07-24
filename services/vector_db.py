@@ -24,4 +24,10 @@ baseline_collection = chroma_client.get_or_create_collection(
     metadata={"hnsw:space": "cosine"},
 )
 
+coach_preference_collection = chroma_client.get_or_create_collection(
+    name="coach_preferences",
+    embedding_function=openai_ef,
+    metadata={"hnsw:space": "cosine"},
+)
+
 logger.info("Chroma collections ready | path=%s", settings.CHROMA_DB_PATH)

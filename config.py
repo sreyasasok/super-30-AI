@@ -7,6 +7,15 @@ class Settings(BaseSettings):
 
     REDIS_URL: str = "redis://localhost:6379"
     OPENAI_API_KEY: str = Field(min_length=1)
+    # Flagship model for both the vision triage/classification calls and the structured-output
+    # insight generation — stronger instruction-following measurably reduces the class of bug
+    # where the model ignores a conditional prompt rule (e.g. emitting a direction token on a
+    # non-directional metric). Centralized here so it's one knob to tune.
+    OPENAI_MODEL: str = "gpt-5"
+    # "minimal" keeps latency in line with the per-event timeouts below (10-12s each, and the
+    # pipeline calls this multiple times per video) — these are short classification/summary
+    # calls, not tasks that benefit from GPT-5's deeper step-by-step reasoning.
+    OPENAI_REASONING_EFFORT: str = "minimal"
     CHROMA_DB_PATH: str = "./chroma_data"
     POSE_LANDMARKER_MODEL_PATH: str = "./models/pose_landmarker_lite.task"
 

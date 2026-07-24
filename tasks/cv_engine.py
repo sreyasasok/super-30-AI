@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -24,6 +25,49 @@ RIGHT_WRIST = 16
 LEFT_HIP, RIGHT_HIP = 23, 24
 RIGHT_KNEE = 26
 LEFT_ANKLE, RIGHT_ANKLE = 27, 28
+
+# The 10 named joints the profile formulas below actually read. Deliberately not the full
+# 33-point BlazePose topology — the other 23 points feed no metric, so there's nothing for
+# a coach to usefully drag when manually correcting a pose (see /pose-corrections).
+LANDMARK_NAME_TO_INDEX = {
+    "NOSE": NOSE,
+    "LEFT_SHOULDER": LEFT_SHOULDER,
+    "RIGHT_SHOULDER": RIGHT_SHOULDER,
+    "RIGHT_ELBOW": RIGHT_ELBOW,
+    "RIGHT_WRIST": RIGHT_WRIST,
+    "LEFT_HIP": LEFT_HIP,
+    "RIGHT_HIP": RIGHT_HIP,
+    "RIGHT_KNEE": RIGHT_KNEE,
+    "LEFT_ANKLE": LEFT_ANKLE,
+    "RIGHT_ANKLE": RIGHT_ANKLE,
+}
+
+# Which of the named joints each tracking profile's formula reads — read directly off the
+# `if profile == ...` bodies in compute_metric_from_landmarks below. Lets the coach app ask
+# for only the joints relevant to the flaw it's showing, instead of all 10 every time.
+PROFILE_RELEVANT_LANDMARKS = {
+    # Batting
+    "SHOULDER_TILT": ["LEFT_SHOULDER", "RIGHT_SHOULDER"],
+    "HAND_BACKLIFT": ["RIGHT_WRIST", "RIGHT_SHOULDER"],
+    "FOOTWORK_WIDTH": ["LEFT_ANKLE", "RIGHT_ANKLE"],
+    "FRONT_KNEE_BEND": ["RIGHT_HIP", "RIGHT_KNEE", "RIGHT_ANKLE"],
+    "HEAD_STABILITY": ["NOSE", "LEFT_SHOULDER", "RIGHT_SHOULDER"],
+    "ELBOW_ELEVATION": ["RIGHT_ELBOW", "RIGHT_SHOULDER"],
+    # Bowling
+    "BOWLING_ARM_HEIGHT": ["RIGHT_WRIST", "RIGHT_SHOULDER"],
+    "FRONT_KNEE_BRACE": ["RIGHT_HIP", "RIGHT_KNEE", "RIGHT_ANKLE"],
+    "RELEASE_ALIGNMENT": ["RIGHT_WRIST", "RIGHT_SHOULDER"],
+}
+
+
+@dataclass
+class Point:
+    """Minimal x/y landmark stand-in. MediaPipe's own landmark objects aren't user-
+    constructible, but compute_metric_from_landmarks only ever reads `.x`/`.y`, so this is
+    enough to splice a coach's manual correction into an otherwise-real landmark list."""
+
+    x: float
+    y: float
 
 # Profiles where the SIGN of the measurement carries real coaching meaning (e.g. "arm too
 # low" vs "arm too high" are different, distinguishable flaws) — these return a signed
@@ -238,22 +282,47 @@ def find_motion_event_frames(video_path: str, fps: float) -> list[tuple[int, np.
     return events
 
 
-def process_biomechanical_math(frame: np.ndarray, profile: str) -> float | None:
-    """Runs pose detection on a single BGR frame and returns the metric for `profile`, or
-    None if no pose could be detected — callers must treat None as "couldn't measure this",
-    not as a genuine zero-deviation reading. Conflating the two was a real bug: a frame
-    where MediaPipe found no landmarks at all still got reported as measured_metric=0.0,
-    indistinguishable from an actual perfect-technique measurement."""
+def detect_landmarks(frame: np.ndarray):
+    """Runs MediaPipe pose detection on a single BGR frame. Returns the raw 33-point
+    landmark list, or None if no pose could be detected."""
     image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image = Image(image_format=ImageFormat.SRGB, data=image_rgb)
     result = _landmarker.detect(mp_image)
-
     if not result.pose_landmarks:
-        logger.warning("No pose landmarks detected for profile=%s", profile)
         return None
+    return result.pose_landmarks[0]
 
-    landmarks = result.pose_landmarks[0]
 
+def extract_named_landmarks(frame: np.ndarray) -> dict[str, dict[str, float]] | None:
+    """Runs pose detection and returns just the 10 named joints (see
+    LANDMARK_NAME_TO_INDEX) as {name: {"x": ..., "y": ...}}, or None if no pose was
+    detected. Used by /frames/pose-landmarks to hand the coach app something to render and
+    let a coach drag into a corrected position."""
+    landmarks = detect_landmarks(frame)
+    if landmarks is None:
+        return None
+    return {
+        name: {"x": landmarks[idx].x, "y": landmarks[idx].y}
+        for name, idx in LANDMARK_NAME_TO_INDEX.items()
+    }
+
+
+def apply_landmark_corrections(landmarks, corrections: dict[str, tuple[float, float]]) -> list:
+    """Returns a copy of `landmarks` (as a plain list) with the named joints in
+    `corrections` overridden to Point(x, y); every other joint is left as the original
+    MediaPipe landmark object. Used by /pose-corrections to compute what a tracking
+    profile's metric would be under a coach's manual joint correction."""
+    corrected = list(landmarks)
+    for name, (x, y) in corrections.items():
+        corrected[LANDMARK_NAME_TO_INDEX[name]] = Point(x=x, y=y)
+    return corrected
+
+
+def compute_metric_from_landmarks(landmarks, profile: str) -> float | None:
+    """Pure math: given a landmark list (real MediaPipe output, or a copy with specific
+    joints overridden by a coach's manual correction — see /pose-corrections), returns the
+    metric for `profile`. Only ever reads `.x`/`.y` off each landmark, so it works
+    identically on either input. Returns None only for an unrecognized profile string."""
     # --- Batting ---
     if profile == "SHOULDER_TILT":
         return abs(landmarks[LEFT_SHOULDER].y - landmarks[RIGHT_SHOULDER].y) * 100
@@ -300,6 +369,19 @@ def process_biomechanical_math(frame: np.ndarray, profile: str) -> float | None:
 
     logger.warning("Unknown tracking profile requested: %s", profile)
     return None
+
+
+def process_biomechanical_math(frame: np.ndarray, profile: str) -> float | None:
+    """Runs pose detection on a single BGR frame and returns the metric for `profile`, or
+    None if no pose could be detected — callers must treat None as "couldn't measure this",
+    not as a genuine zero-deviation reading. Conflating the two was a real bug: a frame
+    where MediaPipe found no landmarks at all still got reported as measured_metric=0.0,
+    indistinguishable from an actual perfect-technique measurement."""
+    landmarks = detect_landmarks(frame)
+    if landmarks is None:
+        logger.warning("No pose landmarks detected for profile=%s", profile)
+        return None
+    return compute_metric_from_landmarks(landmarks, profile)
 
 
 RELEASE_SEARCH_WINDOW_SECONDS = 0.75

@@ -117,7 +117,106 @@ As the Python background worker processes each motion event in the video, it pub
 
 ---
 
-## 📈 2. Historical Baseline Management APIs
+## 🖐️ 2. Manual Pose Correction APIs
+These two endpoints let a coach manually correct a joint's position on an AI-detected frame — e.g. dragging the shoulder to where it should have been — instead of always relying on the AI's own reading of a "good" video. Used for two purposes: (a) deriving a **Fixed Reference Baseline** value from a coach's manual correction rather than a whole separate "good" video, and (b) **symptom vs. root-cause annotation** — linking a visible flaw (e.g. "playing away from the body") to the underlying mechanical cause the coach points to.
+
+**Coordinate contract:** All `x`/`y` values in this section are normalized floats in `[0, 1]`, the same convention MediaPipe returns — origin top-left, `y` increasing downward. The mobile app must convert a screen drag back into normalized coordinates relative to the video frame's natural width/height before sending; do **not** send raw pixel coordinates.
+
+### **POST** `/api/v1/ai/frames/pose-landmarks`
+* **Purpose:** Returns the AI-detected joint positions for a video's peak-motion frame, for the coach app to render and let the coach drag one into a corrected position.
+* **Request Payload:**
+  * `video_path` (string, required): Path to the video to extract the frame from.
+  * `tracking_profile` (string, optional): One of the `TRACKING_PROFILES`. If given, only the joints that profile's metric actually reads are returned (e.g. `SHOULDER_TILT` → just `LEFT_SHOULDER`/`RIGHT_SHOULDER`). Omit to get all 10 tracked joints.
+
+#### **Request Example:**
+```json
+{
+  "video_path": "/app/uploads/session_101.mp4",
+  "tracking_profile": "SHOULDER_TILT"
+}
+```
+#### **Response:** `200 OK`
+```json
+{
+  "status": 200,
+  "message": "Success",
+  "data": {
+    "landmarks": {
+      "LEFT_SHOULDER": {"x": 0.44, "y": 0.31},
+      "RIGHT_SHOULDER": {"x": 0.58, "y": 0.30}
+    },
+    "relevant_to_profile": ["LEFT_SHOULDER", "RIGHT_SHOULDER"]
+  }
+}
+```
+* **Errors:** `404 NOT_FOUND` (video missing), `422 UNPROCESSABLE_ENTITY` (video unreadable or no pose detected — prompt the coach to scrub to a clearer adjacent frame and retry).
+
+---
+
+### **POST** `/api/v1/ai/pose-corrections`
+* **Purpose:** Recomputes a tracking profile's metric using the coach's corrected joint position(s) instead of the AI's raw detection.
+* **Request Payload:**
+  * `video_path` (string, required)
+  * `tracking_profile` (string, required): One of the `TRACKING_PROFILES`.
+  * `corrections` (array, required, min 1): `[{"landmark_name": "RIGHT_SHOULDER", "x": 0.58, "y": 0.28}, ...]`. `landmark_name` must be one of the 10 tracked joints (see §6).
+  * `purpose` (string, required): `"BASELINE"` or `"ROOT_CAUSE"`.
+    * `BASELINE`: the response's `corrected_value` is exactly what to pass as `baseline_value` to `POST /players/{player_id}/baselines` (§3) to persist it. No LLM call is made — keeps this path fast.
+    * `ROOT_CAUSE`: pairs the correction with `note_context` to explain what the correction implies about the underlying technical cause.
+  * `note_context` (string, optional): The coach's symptom note (e.g. `"playing away from body"`). Only used, and only produces a `root_cause_summary`, when `purpose="ROOT_CAUSE"`.
+
+#### **Request Example (Baseline calibration):**
+```json
+{
+  "video_path": "/app/uploads/cover_drive_101.mp4",
+  "tracking_profile": "SHOULDER_TILT",
+  "corrections": [{"landmark_name": "RIGHT_SHOULDER", "x": 0.58, "y": 0.28}],
+  "purpose": "BASELINE"
+}
+```
+#### **Response:** `200 OK`
+```json
+{
+  "status": 200,
+  "message": "Success",
+  "data": {
+    "tracking_profile": "SHOULDER_TILT",
+    "original_value": 3.4,
+    "corrected_value": 0.6,
+    "deviation_from_original": -2.8,
+    "root_cause_summary": null
+  }
+}
+```
+
+#### **Request Example (Root-cause annotation):**
+```json
+{
+  "video_path": "/app/uploads/cover_drive_101.mp4",
+  "tracking_profile": "SHOULDER_TILT",
+  "corrections": [{"landmark_name": "RIGHT_SHOULDER", "x": 0.58, "y": 0.28}],
+  "purpose": "ROOT_CAUSE",
+  "note_context": "Player is playing away from the body on cover drives"
+}
+```
+#### **Response:** `200 OK`
+```json
+{
+  "status": 200,
+  "message": "Success",
+  "data": {
+    "tracking_profile": "SHOULDER_TILT",
+    "original_value": 3.4,
+    "corrected_value": 0.6,
+    "deviation_from_original": -2.8,
+    "root_cause_summary": "The shoulder isn't driving fully into the shot, which is what's pushing the bat away from the body on cover drives."
+  }
+}
+```
+* **Errors:** `404 NOT_FOUND` (video missing), `422 UNPROCESSABLE_ENTITY` (video unreadable or no pose detected).
+
+---
+
+## 📈 3. Historical Baseline Management APIs
 These REST endpoints are used to store and manage the player's reference metrics when a coach resolves a flaw and clicks **"Mark as Fixed"**. When registered, standard video analyses automatically check for regressions using these baselines in the background.
 
 ### **POST** `/api/v1/ai/players/{player_id}/baselines`
@@ -199,7 +298,7 @@ These REST endpoints are used to store and manage the player's reference metrics
 
 ---
 
-## 🎯 3. Standalone Regression Checker API
+## 🎯 4. Standalone Regression Checker API
 If Node.js wants to test or execute a specific comparison ad-hoc outside of the automatic upload queue, use this standalone endpoint.
 
 ### **POST** `/api/v1/ai/regression-checks`
@@ -252,7 +351,7 @@ If Node.js wants to test or execute a specific comparison ad-hoc outside of the 
 
 ---
 
-## 📚 4. Smart Drill Recommendation APIs
+## 📚 5. Smart Drill Recommendation APIs
 
 ### **POST** `/api/v1/ai/drill-embeddings`
 * **Purpose:** Indexes a batch of skills/drills into ChromaDB. Existing `drill_id` keys are updated in-place (upsert).
@@ -296,6 +395,7 @@ If Node.js wants to test or execute a specific comparison ad-hoc outside of the 
   * `note_id` (string): Unique ID of the coach note card.
   * `combined_search_text` (string): The notes text to query ChromaDB with.
   * `limit` (int, default 3): Top $N$ matching drills (range 1-10).
+  * `coach_id` (string, optional): If provided, looks back at up to 15 of this coach's most similar past feedback entries (logged via `/drill-recommendation-feedback` below), keeps only the ones that clear the same similarity cutoff standard matching uses, and — if any qualify — leads the results with whichever drill the coach picked **most often** among them (ties broken by textual closeness), marked `"personalized": true`. This means a drill the coach has chosen repeatedly for this kind of issue outranks a drill from a single one-off past note that merely happens to be worded closer to the new one — the boost reflects the coach's actual pattern, not a coin-flip on phrasing.
 
 #### **Response:** `200 OK`
 ```json
@@ -309,12 +409,15 @@ If Node.js wants to test or execute a specific comparison ad-hoc outside of the 
         "drill_id": "drill_footwork_01",
         "name": "Step-to-Ball Drill",
         "category": "BATTING",
-        "similarity_score": 0.58
+        "similarity_score": 0.58,
+        "personalized": true,
+        "times_previously_selected": 3
       }
     ]
   }
 }
 ```
+* Note: `"personalized"` and `"times_previously_selected"` only appear on a boosted entry; standard semantic matches omit both keys entirely.
 
 ---
 
@@ -325,6 +428,7 @@ If Node.js wants to test or execute a specific comparison ad-hoc outside of the 
     * `note_id` (string): ID of the note.
     * `combined_search_text` (string): Notes to match.
     * `limit` (int): limits.
+    * `coach_id` (string, optional): Same personalization behavior as the single-item endpoint above, applied per item.
 
 #### **Response:** `200 OK`
 ```json
@@ -388,7 +492,43 @@ If Node.js wants to test or execute a specific comparison ad-hoc outside of the 
 
 ---
 
-## 📋 5. Valid Tracking Profile Keys
+### **POST** `/api/v1/ai/drill-recommendation-feedback`
+* **Purpose:** Logs whether a coach accepted an AI-suggested drill or overrode it with a manual pick. This is the write side of the `coach_id` personalization loop on `/drill-recommendations` — call this every time a coach finalizes a drill choice for a note/flaw card, and future recommendations for that coach on similar flaws will lead with what they picked here.
+* **Request Payload:**
+  * `note_id` (string, required): ID of the note/flaw card the coach was resolving.
+  * `coach_id` (string, required): The coach making the pick.
+  * `combined_search_text` (string, required): The same notes text that was used to fetch suggestions — this is what gets matched against on future recommendation calls.
+  * `suggested_drill_ids` (array of strings): What the AI proposed at the time.
+  * `selected_drill_id` (string, required): What the coach actually attached to the note. `accepted` is computed server-side as `selected_drill_id in suggested_drill_ids` — it isn't taken as a client-supplied flag.
+* Calling this twice with the same `note_id`+`coach_id` overwrites the earlier entry (upsert) — safe to call again if a coach revises their pick on the same note.
+
+#### **Request Example:**
+```json
+{
+  "note_id": "note_card_5544",
+  "coach_id": "coach_raj_01",
+  "combined_search_text": "Watch the front foot alignment here",
+  "suggested_drill_ids": ["drill_footwork_01", "drill_stance_02"],
+  "selected_drill_id": "drill_stance_02"
+}
+```
+#### **Response:** `201 Created`
+```json
+{
+  "status": 201,
+  "message": "Success",
+  "data": {
+    "note_id": "note_card_5544",
+    "coach_id": "coach_raj_01",
+    "selected_drill_id": "drill_stance_02",
+    "accepted": true
+  }
+}
+```
+
+---
+
+## 📋 6. Valid Tracking Profile Keys
 When passing a profile value to `tracking_profile` in requests, you must use one of these exact, validated strings:
 
 ### **Batting Profiles:**
@@ -403,3 +543,30 @@ When passing a profile value to `tracking_profile` in requests, you must use one
 * `"BOWLING_ARM_HEIGHT"` - Bowling arm height at release.
 * `"FRONT_KNEE_BRACE"` - Front leg brace on landing.
 * `"RELEASE_ALIGNMENT"` - Bowling arm lateral alignment.
+
+### **Valid `landmark_name` Keys** (for §2's `/frames/pose-landmarks` and `/pose-corrections`):
+These are the only 10 joints the tracking profiles above ever read — not the full 33-point BlazePose skeleton, since the other points feed no metric:
+`"NOSE"`, `"LEFT_SHOULDER"`, `"RIGHT_SHOULDER"`, `"RIGHT_ELBOW"`, `"RIGHT_WRIST"`, `"LEFT_HIP"`, `"RIGHT_HIP"`, `"RIGHT_KNEE"`, `"LEFT_ANKLE"`, `"RIGHT_ANKLE"`.
+
+---
+
+## 🆕 7. Changelog — What's New Since the Previous Version
+
+For integrators who already built against an earlier version of this doc: here's everything that changed, grouped by whether it affects your integration code.
+
+### New endpoints (§2, §5)
+* **`POST /frames/pose-landmarks`** — new. Returns AI-detected joint positions for a video frame, for the coach app to render and let a coach drag a joint into a corrected position.
+* **`POST /pose-corrections`** — new. Takes a coach's manual joint correction and recomputes the tracking metric, for either baseline calibration (`purpose="BASELINE"`) or symptom→root-cause annotation (`purpose="ROOT_CAUSE"`).
+* **`POST /drill-recommendation-feedback`** — new. Logs whether a coach accepted an AI drill suggestion or overrode it — the write side of the personalization loop below.
+
+### Changed request/response contracts (§5)
+* **`POST /drill-recommendations`** and **`POST /batch-drill-recommendations`** — both gained an optional `coach_id` field. When present, the response's `suggested_drills` can now include two new fields on a boosted entry: `"personalized": true` and `"times_previously_selected": <int>`. Existing integrations that omit `coach_id` are unaffected — behavior and response shape are identical to before.
+* The personalization logic itself evolved mid-build: it started as "boost whichever single past note is worded closest to the new one," then was corrected to "boost whichever drill the coach has actually picked **most often** among their similar past notes" (aggregated over up to 15 past entries, not just the nearest one). If you integrated against an early version of this feature, no request/response shape changed — only which drill gets boosted in ambiguous cases, and the new `times_previously_selected` field is what surfaces the aggregation.
+
+### Document structure
+* A new §2 (Manual Pose Correction APIs) was inserted, which shifted every section after it down by one: old §2 (Historical Baseline Management) is now §3, old §3 (Standalone Regression Checker) is now §4, old §4 (Smart Drill Recommendation APIs) is now §5, old §5 (Valid Tracking Profile Keys) is now §6. Update any internal links/bookmarks to this doc accordingly.
+* §6 gained a new subsection listing the 10 valid `landmark_name` values used by §2's endpoints.
+
+### Internal quality fixes (no contract change, but response *text* quality improved)
+* Fixed a bug where `ai_insight_summary` / `player_friendly_summary` (video-analyses telemetry) and `insight_text` / `player_friendly_summary` (`/regression-checks`) could come back with visibly broken grammar for non-directional metrics (e.g. `SHOULDER_TILT`, `FOOTWORK_WIDTH`, `HEAD_STABILITY`) — a leaked template placeholder left sentences like *"...was previously  but has now become ,"*. These fields are now guaranteed grammatically complete; no field was added, removed, or renamed.
+* The underlying OpenAI model used for vision triage/classification and all insight-text generation was upgraded (GPT-4o-mini → GPT-5, minimal reasoning effort). No contract change, but expect somewhat richer/more specific `primary_flaw`, `secondary_issues`, and summary text than earlier integration testing may have seen.

@@ -89,7 +89,8 @@ async def _classify_discipline(frame, session_id: str) -> str:
     base64_image = base64.b64encode(buffer).decode("utf-8")
     try:
         response = await openai_client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
+            model=settings.OPENAI_MODEL,
+            reasoning_effort=settings.OPENAI_REASONING_EFFORT,
             response_format=DisciplineClassificationSchema,
             messages=[
                 {
@@ -132,7 +133,7 @@ def _downscale_for_vision(frame):
 
 
 async def _run_vision_triage(frame, session_id: str, discipline: str):
-    """Classifies the tracking profile for a single BGR frame via GPT-4o-mini structured
+    """Classifies the tracking profile for a single BGR frame via structured
     output, using the schema/prompt for the given discipline (BATTING or BOWLING) so the
     model can only pick a profile that's actually valid for that discipline."""
     schema = _TRIAGE_SCHEMAS_BY_DISCIPLINE[discipline]
@@ -146,7 +147,8 @@ async def _run_vision_triage(frame, session_id: str, discipline: str):
 
     try:
         response = await openai_client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
+            model=settings.OPENAI_MODEL,
+            reasoning_effort=settings.OPENAI_REASONING_EFFORT,
             response_format=schema,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -219,12 +221,22 @@ async def _generate_video_insight(
             "bowling arm'). Do NOT write the physical correction word yourself."
         )
     else:
-        metric_line = f"Metric: {assigned_profile} ({friendly_name}). Measured deviation: {measured_metric:.2f}%."
-        player_instruction = "Speak directly to the player about focusing on standard form for this metric."
+        metric_line = (
+            f"Metric: {assigned_profile} ({friendly_name}) — NOT a directional metric. "
+            f"Measured deviation: {measured_metric:.2f}%. Do NOT use the words 'high', 'low', 'left', or "
+            "'right' to describe this — describe the deviation only by its size/percentage."
+        )
+        player_instruction = (
+            "Speak directly to the player about focusing on standard form for this metric. "
+            "This is NOT a directional metric: do not use the literal token '{direction}' or "
+            "'{player_adjustment}' anywhere in either summary — write plain, complete sentences "
+            "with no placeholders."
+        )
 
     try:
         response = await openai_client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
+            model=settings.OPENAI_MODEL,
+            reasoning_effort=settings.OPENAI_REASONING_EFFORT,
             response_format=VideoInsightSchema,
             messages=[
                 {
@@ -234,10 +246,13 @@ async def _generate_video_insight(
                         f"{metric_line} Primary flaw: '{primary_flaw}'. Secondary issues: "
                         f"{secondary_issues}.\n"
                         "1) coach_summary: one precise sentence for a coach, referencing the metric and "
-                        "the deviation. IMPORTANT: If this is a directional metric, you MUST use the literal "
-                        "token '{direction}' in your sentence where the direction (e.g. high/low/left/right) "
-                        "belongs (e.g., 'indicating the bowling arm is {direction} at release'). Do NOT write "
-                        "the direction word yourself.\n"
+                        "the deviation. The metric line above already tells you whether this is a directional "
+                        "metric or not — follow that, don't guess. IMPORTANT: ONLY if the metric line says this "
+                        "IS a directional metric, you MUST use the literal token '{direction}' in your sentence "
+                        "where the direction (e.g. high/low/left/right) belongs (e.g., 'indicating the bowling "
+                        "arm is {direction} at release'), and do NOT write the direction word yourself. If the "
+                        "metric line says this is NOT directional, never use that token at all — describe the "
+                        "deviation using only the percentage.\n"
                         "2) player_friendly_summary: one encouraging sentence a young player or their "
                         "parent can understand with no jargon, profile codes, or percentages — just what "
                         "changed and what to work on. "
@@ -265,10 +280,17 @@ async def _generate_video_insight(
             else:
                 player_friendly_summary = f"{player_friendly_summary.rstrip('.')} (correction: {adjustment_label})."
         else:
-            # Strip any accidental template tokens from non-directional metrics
-            for token in ("{direction}", "{player_adjustment}", "{current_direction}", "{baseline_direction}"):
-                coach_summary = coach_summary.replace(token, "").replace("  ", " ")
-                player_friendly_summary = player_friendly_summary.replace(token, "").replace("  ", " ")
+            # A non-directional profile's summary should never contain a direction token — the
+            # prompt tells the model not to. If it ignores that anyway, naively stripping the
+            # token leaves a grammatically broken sentence. Rather than patch broken text, treat
+            # it as a malformed response and use the deterministic, always-grammatical fallback.
+            reserved_tokens = ("{direction}", "{player_adjustment}", "{current_direction}", "{baseline_direction}")
+            if any(token in coach_summary or token in player_friendly_summary for token in reserved_tokens):
+                logger.warning(
+                    "Non-directional video insight leaked a direction token, using fallback | "
+                    "session_id=%s profile=%s", session_id, assigned_profile,
+                )
+                return fallback_coach, fallback_player
 
         return coach_summary, player_friendly_summary
     except Exception as exc:
