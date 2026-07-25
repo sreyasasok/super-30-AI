@@ -11,6 +11,7 @@ from config import settings
 from core.logging import get_logger
 from services.broker import broker, redis_client
 from services.vector_db import baseline_collection
+from services.video_fetch import VideoFetchError, cleanup_video_source, resolve_video_source
 from tasks.cv_engine import (
     DIRECTIONAL_PROFILES,
     TRACKING_PROFILE_FRIENDLY_NAMES,
@@ -437,41 +438,55 @@ async def pipeline_agentic_video_analysis(
 
     Because events run concurrently, messages can arrive out of event_index order —
     consumers must key off event_index, not arrival order.
+
+    `video_path` may be a local path or a public http(s) URL (e.g. an S3/GCS/CDN link). The
+    download (if any) happens here, inside the worker, rather than in the API route handler —
+    that keeps the route's 202 response instant regardless of video size, since this task
+    already runs asynchronously off the request/response cycle.
     """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        logger.error("Could not open video | session_id=%s path=%s", session_id, video_path)
+    try:
+        local_path, is_temp = await resolve_video_source(video_path)
+    except VideoFetchError as exc:
+        logger.error("Failed to download remote video | session_id=%s error=%s", session_id, exc)
+        return
+
+    try:
+        cap = cv2.VideoCapture(local_path)
+        if not cap.isOpened():
+            logger.error("Could not open video | session_id=%s path=%s", session_id, video_path)
+            cap.release()
+            return
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         cap.release()
-        return
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    cap.release()
 
-    events = find_motion_event_frames(video_path, fps)
-    if not events:
-        logger.error("No motion events detected | session_id=%s path=%s", session_id, video_path)
-        return
+        events = find_motion_event_frames(local_path, fps)
+        if not events:
+            logger.error("No motion events detected | session_id=%s path=%s", session_id, video_path)
+            return
 
-    total_events = len(events)
-    logger.info("Detected %s motion event(s) | session_id=%s", total_events, session_id)
+        total_events = len(events)
+        logger.info("Detected %s motion event(s) | session_id=%s", total_events, session_id)
 
-    if discipline is None:
-        _, first_frame = events[0]
-        discipline = await _classify_discipline(first_frame, session_id)
-    else:
-        logger.info("Using app-supplied discipline | session_id=%s discipline=%s", session_id, discipline)
+        if discipline is None:
+            _, first_frame = events[0]
+            discipline = await _classify_discipline(first_frame, session_id)
+        else:
+            logger.info("Using app-supplied discipline | session_id=%s discipline=%s", session_id, discipline)
 
-    if discipline == "BOWLING":
-        # Raw frame-differencing can't tell run-up/follow-through motion from the release
-        # itself — confirmed via a real-footage audit that some coarse events landed
-        # mid-run-up instead of at release. Refine each one to the frame with peak wrist
-        # elevation within a window, which is a real release-point signature.
-        refined_events = []
-        for frame_index, frame in events:
-            refined = find_bowling_release_frame(video_path, frame_index, fps)
-            refined_events.append(refined if refined is not None else (frame_index, frame))
-        events = refined_events
+        if discipline == "BOWLING":
+            # Raw frame-differencing can't tell run-up/follow-through motion from the release
+            # itself — confirmed via a real-footage audit that some coarse events landed
+            # mid-run-up instead of at release. Refine each one to the frame with peak wrist
+            # elevation within a window, which is a real release-point signature.
+            refined_events = []
+            for frame_index, frame in events:
+                refined = find_bowling_release_frame(local_path, frame_index, fps)
+                refined_events.append(refined if refined is not None else (frame_index, frame))
+            events = refined_events
 
-    await asyncio.gather(*(
-        _process_event(event_index, frame_index, frame, fps, session_id, player_id, total_events, discipline)
-        for event_index, (frame_index, frame) in enumerate(events)
-    ))
+        await asyncio.gather(*(
+            _process_event(event_index, frame_index, frame, fps, session_id, player_id, total_events, discipline)
+            for event_index, (frame_index, frame) in enumerate(events)
+        ))
+    finally:
+        cleanup_video_source(local_path, is_temp)

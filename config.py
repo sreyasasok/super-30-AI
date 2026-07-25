@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     OPENAI_REASONING_EFFORT: str = "minimal"
     CHROMA_DB_PATH: str = "./chroma_data"
     POSE_LANDMARKER_MODEL_PATH: str = "./models/pose_landmarker_lite.task"
+    # video_path/current_video_path fields accept a public http(s) URL (e.g. an S3/GCS/CDN
+    # link) in addition to a local filesystem path; this bounds how long we'll wait for that
+    # download before giving up. Generous because coaching session videos can be sizeable.
+    VIDEO_DOWNLOAD_TIMEOUT_SECONDS: float = 120.0
 
     REGRESSION_THRESHOLD: float = 0.15
     # Calibrated against real text-embedding-3-small cosine similarities on a 6-drill /

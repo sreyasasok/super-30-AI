@@ -11,6 +11,7 @@ from api.errors import ApiError
 from config import settings
 from core.logging import get_logger
 from services.vector_db import drill_collection, baseline_collection, coach_preference_collection
+from services.video_fetch import VideoFetchError, cleanup_video_source, is_remote_url, resolve_video_source
 from tasks.cv_engine import (
     DIRECTIONAL_PROFILES,
     PROFILE_RELEVANT_LANDMARKS,
@@ -59,7 +60,7 @@ TRACKING_PROFILES = Literal[
 
 
 class VideoAnalysisRequest(BaseModel):
-    video_path: str = Field(min_length=1)
+    video_path: str = Field(min_length=1, description="Local filesystem path or a public http(s) URL (e.g. an S3/GCS/CDN link).")
     session_id: str = Field(min_length=1)
     player_id: str = Field(min_length=1)
     discipline: Optional[Literal["BATTING", "BOWLING"]] = Field(
@@ -88,7 +89,7 @@ LANDMARK_NAMES = Literal[
 
 
 class PoseLandmarksRequest(BaseModel):
-    video_path: str = Field(min_length=1)
+    video_path: str = Field(min_length=1, description="Local filesystem path or a public http(s) URL (e.g. an S3/GCS/CDN link).")
     tracking_profile: Optional[TRACKING_PROFILES] = Field(
         default=None,
         description="If given, only the joints that profile's metric reads are returned. "
@@ -103,7 +104,7 @@ class LandmarkCorrection(BaseModel):
 
 
 class PoseCorrectionRequest(BaseModel):
-    video_path: str = Field(min_length=1)
+    video_path: str = Field(min_length=1, description="Local filesystem path or a public http(s) URL (e.g. an S3/GCS/CDN link).")
     tracking_profile: TRACKING_PROFILES
     corrections: List[LandmarkCorrection] = Field(min_length=1, description="One or more joints the coach dragged into a corrected position.")
     purpose: Literal["BASELINE", "ROOT_CAUSE"] = Field(
@@ -126,7 +127,7 @@ class DrillRecommendationFeedbackRequest(BaseModel):
 
 
 class RegressionCheckRequest(BaseModel):
-    current_video_path: str = Field(min_length=1)
+    current_video_path: str = Field(min_length=1, description="Local filesystem path or a public http(s) URL (e.g. an S3/GCS/CDN link).")
     tracking_profile: TRACKING_PROFILES
     # Not gt=0: DIRECTIONAL_PROFILES (e.g. BOWLING_ARM_HEIGHT) return signed measurements,
     # so a legitimate baseline can be negative (arm above shoulder) or zero (level with
@@ -288,22 +289,32 @@ def _apply_personalization_boost(
     return result[:limit]
 
 
-def _read_peak_frame_or_error(video_path: str):
+async def _read_peak_frame_or_error(video_path: str):
     """Shared by every endpoint that needs the action frame from a video, so they all measure
     the same frame for the same clip instead of drifting between "middle frame" and "peak
-    motion frame" strategies."""
-    if not os.path.isfile(video_path):
+    motion frame" strategies. `video_path` may be a local path or a public http(s) URL (e.g.
+    an S3/GCS/CDN link) — resolved transparently, and any downloaded temp file is always
+    cleaned up before returning, whether via the frame being found or an error being raised."""
+    if not is_remote_url(video_path) and not os.path.isfile(video_path):
         raise ApiError(status.HTTP_404_NOT_FOUND, "NOT_FOUND", f"Video file not found: {video_path}")
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        cap.release()
-        raise ApiError(status.HTTP_400_BAD_REQUEST, "INVALID_VIDEO", "Unable to read target video file format.")
+    try:
+        local_path, is_temp = await resolve_video_source(video_path)
+    except VideoFetchError as exc:
+        raise ApiError(status.HTTP_422_UNPROCESSABLE_CONTENT, "VIDEO_DOWNLOAD_FAILED", str(exc))
 
     try:
-        peak = find_peak_motion_frame(cap)
+        cap = cv2.VideoCapture(local_path)
+        if not cap.isOpened():
+            cap.release()
+            raise ApiError(status.HTTP_400_BAD_REQUEST, "INVALID_VIDEO", "Unable to read target video file format.")
+
+        try:
+            peak = find_peak_motion_frame(cap)
+        finally:
+            cap.release()
     finally:
-        cap.release()
+        cleanup_video_source(local_path, is_temp)
 
     if peak is None:
         raise ApiError(status.HTTP_422_UNPROCESSABLE_CONTENT, "UNPROCESSABLE_ENTITY", "Video has no readable frames.")
@@ -518,7 +529,11 @@ def _generate_root_cause_summary(
 
 @router.post("/video-analyses", status_code=status.HTTP_202_ACCEPTED)
 async def analyze_video(payload: VideoAnalysisRequest):
-    if not os.path.isfile(payload.video_path):
+    # A URL is only validated for shape here — the actual download happens inside the
+    # background task itself (pipeline_agentic_video_analysis), not in this handler, so a
+    # large video's download time never delays the 202 response. A local path, by contrast,
+    # can be checked for real right now, so we still fail fast on an obviously bad one.
+    if not is_remote_url(payload.video_path) and not os.path.isfile(payload.video_path):
         raise ApiError(status.HTTP_404_NOT_FOUND, "NOT_FOUND", f"Video file not found: {payload.video_path}")
 
     await pipeline_agentic_video_analysis.kiq(
@@ -538,7 +553,7 @@ async def get_frame_pose_landmarks(payload: PoseLandmarksRequest):
     """Returns the AI-detected joint positions for a video's peak-motion frame, so the coach
     app can render them and let a coach drag one into a corrected position (see
     /pose-corrections)."""
-    frame = _read_peak_frame_or_error(payload.video_path)
+    frame = await _read_peak_frame_or_error(payload.video_path)
     landmarks = extract_named_landmarks(frame)
     if landmarks is None:
         raise ApiError(
@@ -571,7 +586,7 @@ async def apply_pose_correction(payload: PoseCorrectionRequest):
     corrected_value is meant to be passed straight to POST /players/{player_id}/baselines.
     purpose=ROOT_CAUSE: pairs the correction with note_context to explain what the
     correction implies about the underlying technical cause of a described symptom."""
-    frame = _read_peak_frame_or_error(payload.video_path)
+    frame = await _read_peak_frame_or_error(payload.video_path)
     landmarks = detect_landmarks(frame)
     if landmarks is None:
         raise ApiError(
@@ -846,7 +861,7 @@ async def regression_check(payload: RegressionCheckRequest):
             "baseline_value cannot be zero (used as a division denominator).",
         )
 
-    frame = _read_peak_frame_or_error(payload.current_video_path)
+    frame = await _read_peak_frame_or_error(payload.current_video_path)
     current_value = process_biomechanical_math(frame, payload.tracking_profile)
     if current_value is None:
         raise ApiError(
