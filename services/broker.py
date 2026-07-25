@@ -16,3 +16,13 @@ result_backend = RedisAsyncResultBackend(redis_url=settings.REDIS_URL)
 broker = ListQueueBroker(url=settings.REDIS_URL, socket_timeout=None).with_result_backend(result_backend)
 
 redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+
+# Registers @broker.task-decorated functions on `broker` as a side effect of this import.
+# Taskiq's worker CLI only knows about tasks from modules it's explicitly told to import
+# (either via a trailing `taskiq worker services.broker:broker tasks.video_tasks` CLI arg, or
+# by that module being imported somewhere reachable from the broker module itself, as here).
+# Without this, a worker started as bare `taskiq worker services.broker:broker` dequeues a job
+# fine but can't find the code for it: "task ... is not found. Maybe you forgot to import it?"
+# Placed at the bottom, after `broker`/`redis_client` are defined, since tasks.video_tasks
+# imports them back — importing any earlier would be a circular import.
+import tasks.video_tasks  # noqa: F401
