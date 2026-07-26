@@ -318,11 +318,60 @@ def apply_landmark_corrections(landmarks, corrections: dict[str, tuple[float, fl
     return corrected
 
 
+# Confirmed via a real-footage audit: MediaPipe can return a "successful" whole-pose
+# detection (result.pose_landmarks non-empty) while individual joints are essentially
+# invisible in that specific frame — e.g. a front-on batting stance where the pads/bat
+# occlude the knee and ankle. It still reports *some* x/y for them (extrapolated, not
+# observed), so a joint-angle formula silently produces a number that looks like a real
+# measurement but is pure noise (one real case: a "front knee bent to 7 degrees" reading
+# from a knee/ankle MediaPipe itself scored at 0.03/0.01 visibility — physically
+# implausible, and visually the leg was clearly not that bent).
+#
+# 0.05, not the 0.5 used for whole-pose detection above — that's a different signal
+# (bounding-box detection confidence, not per-landmark visibility) and reusing its value
+# here was wrong: an audit of every profile's min-relevant-visibility across a real test
+# video's events found a genuine, isolated cluster at 0.00-0.01 (truly no idea where the
+# joint is), then a clean gap of ~0.10, then a continuous, mostly-legitimate range
+# starting at 0.11 — normal, lower-but-real confidence from fast limb motion (e.g. the
+# wrist mid-swing), not a detection failure. 0.5 rejected most of that legitimate range
+# too (publish rate dropped from 15/19 to 7/19 events on the same test video); 0.05 sits
+# in the empirical gap and only catches the genuinely-broken cluster.
+MIN_LANDMARK_VISIBILITY = 0.05
+
+# A second, stricter bar for claims where being wrong costs more coach trust than a routine
+# flaw card: a second simultaneous finding (additional_findings) or a regression alert
+# ("a previously-fixed habit is returning"). Unlike MIN_LANDMARK_VISIBILITY, this isn't from
+# a clean empirical gap in the data — it's a judgment call that these specific claims should
+# only fire on decidedly-more-likely-than-not confidence, not just "not obviously broken".
+# Revisit with real coach feedback (flagged-as-inaccurate findings) once that data exists.
+HIGH_CONFIDENCE_MIN_VISIBILITY = 0.5
+
+
+def get_relevant_visibility(landmarks, profile: str) -> float:
+    """Lowest visibility score among the landmarks `profile`'s formula actually reads.
+    getattr(..., 1.0) treats a coach's manually-corrected Point (see apply_landmark_corrections)
+    as fully trusted — a deliberate correction has no 'detection confidence' to question —
+    so this only ever gates on the OTHER, still-real-detected landmarks in the same set.
+    Public (not just an internal compute_metric_from_landmarks helper) so callers can apply
+    a stricter bar than MIN_LANDMARK_VISIBILITY for higher-stakes claims — see
+    HIGH_CONFIDENCE_MIN_VISIBILITY."""
+    relevant_names = PROFILE_RELEVANT_LANDMARKS.get(profile, [])
+    if not relevant_names:
+        return 1.0
+    return min(getattr(landmarks[LANDMARK_NAME_TO_INDEX[name]], "visibility", 1.0) for name in relevant_names)
+
+
 def compute_metric_from_landmarks(landmarks, profile: str) -> float | None:
     """Pure math: given a landmark list (real MediaPipe output, or a copy with specific
     joints overridden by a coach's manual correction — see /pose-corrections), returns the
     metric for `profile`. Only ever reads `.x`/`.y` off each landmark, so it works
-    identically on either input. Returns None only for an unrecognized profile string."""
+    identically on either input. Returns None for an unrecognized profile string, or if any
+    landmark the profile depends on has visibility below MIN_LANDMARK_VISIBILITY (MediaPipe's
+    own signal that it couldn't actually locate that joint) — callers must treat this the
+    same as a full pose-detection failure, not a genuine zero-deviation reading."""
+    if get_relevant_visibility(landmarks, profile) < MIN_LANDMARK_VISIBILITY:
+        return None
+
     # --- Batting ---
     if profile == "SHOULDER_TILT":
         return abs(landmarks[LEFT_SHOULDER].y - landmarks[RIGHT_SHOULDER].y) * 100

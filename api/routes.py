@@ -14,6 +14,7 @@ from services.vector_db import drill_collection, baseline_collection, coach_pref
 from services.video_fetch import VideoFetchError, cleanup_video_source, is_remote_url, resolve_video_source
 from tasks.cv_engine import (
     DIRECTIONAL_PROFILES,
+    HIGH_CONFIDENCE_MIN_VISIBILITY,
     PROFILE_RELEVANT_LANDMARKS,
     TRACKING_PROFILE_FRIENDLY_NAMES,
     apply_landmark_corrections,
@@ -23,7 +24,7 @@ from tasks.cv_engine import (
     find_peak_motion_frame,
     get_directional_label,
     get_player_adjustment_label,
-    process_biomechanical_math,
+    get_relevant_visibility,
 )
 from tasks.video_tasks import pipeline_agentic_video_analysis
 
@@ -606,6 +607,16 @@ async def apply_pose_correction(payload: PoseCorrectionRequest):
     corrections_map = {c.landmark_name: (c.x, c.y) for c in payload.corrections}
     corrected_landmarks = apply_landmark_corrections(landmarks, corrections_map)
     corrected_value = compute_metric_from_landmarks(corrected_landmarks, payload.tracking_profile)
+    if corrected_value is None:
+        # Shouldn't happen in practice — a correction only ever raises a landmark's visibility
+        # to fully-trusted (see apply_landmark_corrections), never lowers it, so if
+        # original_value passed the visibility gate above, this should too. Guarded anyway
+        # rather than assuming the invariant always holds.
+        raise ApiError(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "UNPROCESSABLE_ENTITY",
+            f"Unable to compute a corrected metric for profile {payload.tracking_profile}.",
+        )
     deviation = corrected_value - original_value
 
     root_cause_summary = None
@@ -862,7 +873,15 @@ async def regression_check(payload: RegressionCheckRequest):
         )
 
     frame = await _read_peak_frame_or_error(payload.current_video_path)
-    current_value = process_biomechanical_math(frame, payload.tracking_profile)
+    landmarks = detect_landmarks(frame)
+    if landmarks is None:
+        raise ApiError(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "UNPROCESSABLE_ENTITY",
+            "Could not detect pose landmarks in the video's action frame — try a clearer or closer clip.",
+        )
+
+    current_value = compute_metric_from_landmarks(landmarks, payload.tracking_profile)
     if current_value is None:
         raise ApiError(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -871,8 +890,20 @@ async def regression_check(payload: RegressionCheckRequest):
         )
 
     variance = abs(payload.baseline_value - current_value) / payload.baseline_value
-    regression_detected = variance > settings.REGRESSION_THRESHOLD
     deviation_percentage = round(variance * 100, 1)
+
+    # A regression alert ("a previously-fixed habit is returning") is a stronger claim than a
+    # routine measurement, so it only fires at HIGH_CONFIDENCE_MIN_VISIBILITY — stricter than
+    # the base gate compute_metric_from_landmarks already applied just to compute current_value
+    # at all. Below that bar, current_value is still returned (the measurement itself passed
+    # the base gate), but no regression is flagged from it.
+    visibility = get_relevant_visibility(landmarks, payload.tracking_profile)
+    regression_detected = variance > settings.REGRESSION_THRESHOLD and visibility >= HIGH_CONFIDENCE_MIN_VISIBILITY
+    if variance > settings.REGRESSION_THRESHOLD and visibility < HIGH_CONFIDENCE_MIN_VISIBILITY:
+        logger.info(
+            "Regression alert suppressed — below high-confidence bar | profile=%s visibility=%.2f",
+            payload.tracking_profile, visibility,
+        )
 
     insight_text = None
     player_friendly_summary = None

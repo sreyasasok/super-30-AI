@@ -25,10 +25,19 @@ The microservice utilizes two distinct patterns for maximum performance and resp
   * `player_id` (string, required): The ID of the player being analyzed (used for automatic regression checks).
   * `discipline` (string, optional): One of `"BATTING"` or `"BOWLING"`. If omitted, the AI runs an automated first-frame vision classification pass to auto-detect whether the player is a batter or bowler.
 
-#### **Request Example:**
+#### **Request Example (public URL):**
 ```json
 {
-  "video_path": "/Users/sreyasasokan/Documents/super30_AI/ai-microservice/test_video_bowling.mp4",
+  "video_path": "https://cdn.example.com/uploads/session_998811.mp4",
+  "session_id": "session_batting_998811",
+  "player_id": "player_rahul_007",
+  "discipline": "BOWLING"
+}
+```
+#### **Request Example (local/mounted path):**
+```json
+{
+  "video_path": "/app/uploads/session_998811.mp4",
   "session_id": "session_batting_998811",
   "player_id": "player_rahul_007",
   "discipline": "BOWLING"
@@ -61,7 +70,7 @@ As the Python background worker processes each motion event in the video, it pub
 * `absolute_seconds` (float): The exact timestamp in the video timeline where this event peaked (e.g. point of release or bat-ball contact).
 * `tracking_profile` (string): The biomechanical profile flagged as the primary error (e.g., `BOWLING_ARM_HEIGHT`, `FOOTWORK_WIDTH`, `HEAD_STABILITY`).
 * `measured_metric` (float): The calculated biomechanical joint angle, height, or width (as a percentage of frame dimensions).
-* `primary_flaw` (string): AI-generated technical description of the error.
+* `primary_flaw` (string): AI-generated technical description of the error. For directional metrics (see §6), any high/low/left/right language in this field is grounded in the actual measured pose data — not the vision model's own guess from the image alone (see §7 changelog).
 * `secondary_issues` (array of strings): Auxiliary technical flaws visible in the action frame.
 * `ai_insight_summary` (string): High-fidelity coach-facing summary.
 * `player_friendly_summary` (string): Encouraging, jargon-free summary tailored for the player/parent.
@@ -71,6 +80,8 @@ As the Python background worker processes each motion event in the video, it pub
   * `deviation_percentage` (float): exact percentage deviation from their baseline.
   * `resolved_at` (string): The date the coach marked this issue as fixed.
   * `baseline_value` (float): The stored baseline coordinate value.
+* `additional_findings` (array, always present, usually empty): A second, genuinely distinct technical issue on a *different* profile than `tracking_profile`, only populated when the AI could confidently see one — e.g. a bowler's arm being simultaneously too high (an instantaneous position issue) *and* crossing too far across the body at release (a motion-path issue only visible across a sequence of frames, not one still). Real-footage testing found both can be true on the same delivery and the current single-frame classifier could only ever report one of them; this field is where the second one shows up rather than being silently dropped. Each entry has the exact same shape as the top-level finding, so the same rendering logic can handle both: `tracking_profile`, `measured_metric`, `primary_flaw`, `ai_insight_summary`, `player_friendly_summary`, and optionally `regression_detected`/`regression_info` (checked independently against that profile's own baseline). Capped at one entry for now — this isn't open-ended multi-issue detection, just the specific coexisting-issue case that was found and verified. Gated on a stricter confidence bar than the top-level finding — see §7 changelog — since a second simultaneous claim costs more coach trust if wrong than the routine primary one.
+* `all_findings` (array, always present): Convenience view — `[the top-level finding] + additional_findings`, all with the identical shape described above. There's no real severity ordering between "primary" and "additional" (the model just names one profile first); that split only exists so the pre-existing top-level fields above stay backward-compatible. A consumer that wants to render N equal-weight finding cards without special-casing "the main one vs. this other array" can just iterate `all_findings` instead.
 
 #### **Redis Message Example (Standard Event):**
 ```json
@@ -86,7 +97,60 @@ As the Python background worker processes each motion event in the video, it pub
   "primary_flaw": "The bowler's head is tilting excessively during the delivery stride.",
   "secondary_issues": ["Bowling arm height dropping below shoulders"],
   "ai_insight_summary": "The HEAD_STABILITY metric shows a 1.23% deviation indicating the bowler's head is tilting excessively during the delivery stride, which is impacting balance and accuracy.",
-  "player_friendly_summary": "Focus on keeping your head steady and upright during your delivery to help improve your balance and accuracy."
+  "player_friendly_summary": "Focus on keeping your head steady and upright during your delivery to help improve your balance and accuracy.",
+  "additional_findings": [],
+  "all_findings": [
+    {
+      "tracking_profile": "HEAD_STABILITY",
+      "measured_metric": 1.23,
+      "primary_flaw": "The bowler's head is tilting excessively during the delivery stride.",
+      "ai_insight_summary": "The HEAD_STABILITY metric shows a 1.23% deviation indicating the bowler's head is tilting excessively during the delivery stride, which is impacting balance and accuracy.",
+      "player_friendly_summary": "Focus on keeping your head steady and upright during your delivery to help improve your balance and accuracy."
+    }
+  ]
+}
+```
+
+#### **Redis Message Example (With a Second, Distinct Finding):**
+```json
+{
+  "session_id": "session_bowling_44210",
+  "player_id": "player_rahul_007",
+  "event_index": 0,
+  "total_events": 9,
+  "discipline": "BOWLING",
+  "absolute_seconds": 0.27,
+  "tracking_profile": "BOWLING_ARM_HEIGHT",
+  "measured_metric": -21.16,
+  "primary_flaw": "Bowling arm is too high at delivery, with the elbow well above the ideal high-arm line.",
+  "secondary_issues": [],
+  "ai_insight_summary": "BOWLING_ARM_HEIGHT deviates by 21.16 units, indicating the bowling arm is too high at release.",
+  "player_friendly_summary": "Great effort — next session, focus on lowering your bowling arm at release for a more consistent position.",
+  "additional_findings": [
+    {
+      "tracking_profile": "RELEASE_ALIGNMENT",
+      "measured_metric": 6.07,
+      "primary_flaw": "Bowling arm is crossing too far right across the body at release rather than staying in line with the target.",
+      "ai_insight_summary": "RELEASE_ALIGNMENT deviates by 6.07 units, indicating the release alignment is too far right.",
+      "player_friendly_summary": "Try to keep your arm coming straight down the line toward the target instead of across your body at release."
+    }
+  ],
+  "all_findings": [
+    {
+      "tracking_profile": "BOWLING_ARM_HEIGHT",
+      "measured_metric": -21.16,
+      "primary_flaw": "Bowling arm is too high at delivery, with the elbow well above the ideal high-arm line.",
+      "ai_insight_summary": "BOWLING_ARM_HEIGHT deviates by 21.16 units, indicating the bowling arm is too high at release.",
+      "player_friendly_summary": "Great effort — next session, focus on lowering your bowling arm at release for a more consistent position."
+    },
+    {
+      "tracking_profile": "RELEASE_ALIGNMENT",
+      "measured_metric": 6.07,
+      "primary_flaw": "Bowling arm is crossing too far right across the body at release rather than staying in line with the target.",
+      "ai_insight_summary": "RELEASE_ALIGNMENT deviates by 6.07 units, indicating the release alignment is too far right.",
+      "player_friendly_summary": "Try to keep your arm coming straight down the line toward the target instead of across your body at release."
+    }
+  ]
 }
 ```
 
@@ -577,4 +641,21 @@ For integrators who already built against an earlier version of this doc: here's
 
 ### Internal quality fixes (no contract change, but response *text* quality improved)
 * Fixed a bug where `ai_insight_summary` / `player_friendly_summary` (video-analyses telemetry) and `insight_text` / `player_friendly_summary` (`/regression-checks`) could come back with visibly broken grammar for non-directional metrics (e.g. `SHOULDER_TILT`, `FOOTWORK_WIDTH`, `HEAD_STABILITY`) — a leaked template placeholder left sentences like *"...was previously  but has now become ,"*. These fields are now guaranteed grammatically complete; no field was added, removed, or renamed.
-* The underlying OpenAI model used for vision triage/classification and all insight-text generation was upgraded (GPT-4o-mini → GPT-5, minimal reasoning effort). No contract change, but expect somewhat richer/more specific `primary_flaw`, `secondary_issues`, and summary text than earlier integration testing may have seen.
+* The underlying OpenAI model used for vision triage/classification and all insight-text generation was upgraded (GPT-4o-mini → GPT-5, minimal reasoning effort), then the fast per-call model was changed again to GPT-5-mini after real-footage testing showed it's meaningfully faster with no quality loss (see the concurrency/model tuning note below). No contract change, but expect somewhat richer/more specific `primary_flaw`, `secondary_issues`, and summary text than earlier integration testing may have seen.
+* **Fixed a real self-consistency bug in `primary_flaw` for directional metrics.** `primary_flaw` is written by the vision-triage call, which only sees the image — it never sees the actual computed `measured_metric`, since that's calculated afterward via MediaPipe. A real-footage comparison found this could produce a flat contradiction: `primary_flaw` said a bowler's arm was "too low" while `ai_insight_summary` (built from the deterministic, pose-landmark-derived measurement) correctly said "too high" for the *same event* — confirmed against the actual frame that "too high" was the correct read. Testing showed this wasn't a one-model problem: both GPT-5 and GPT-5-mini scored only 1/3 correct on blind directional judgment from a still frame, i.e. neither model's own visual guess is trustworthy here regardless of choice. `primary_flaw` is now rewritten (reusing the existing insight-generation call, no added API round-trip) so any directional language in it always matches the deterministic measurement — the same token-substitution technique already used for `ai_insight_summary`. No field was added, removed, or renamed; only the *correctness* of `primary_flaw`'s directional wording changed.
+* **`VIDEO_EVENT_CONCURRENCY` raised from 1 to 8** (internal config, not part of the API contract) after confirming real rate-limit headroom (499/500 requests, 499,997/500,000 tokens remaining per response headers) and proving the shared MediaPipe pose-detector instance is safe under concurrent access. Cuts total `/video-analyses` background processing time roughly 3-4x (e.g. a 19-event clip: ~123s → ~29s) with no change in which events get detected/skipped.
+
+### New: `additional_findings` (§1) — a second, distinct issue can now be reported per event
+* Vision triage now sees a short clip of frames around each event (not just one still) instead of a single frame, purely for classification — pose math is unchanged and still only ever measures the one canonical frame.
+* Real-footage testing found this surfaces a genuinely separate class of issue: a single still frame reliably shows *instantaneous position* flaws (e.g. arm height), but a motion-path flaw (e.g. the arm crossing across the body at release) often only becomes visible across a sequence. Confirmed against deterministic pose math on real frames that both issues can be true *simultaneously* on the same delivery, and that the previous single-frame classifier only ever reported the instantaneous one, silently never surfacing the motion-path one.
+* New field `additional_findings` (array, always present, usually empty) on the `shot_updates` telemetry — purely additive, same shape as the existing top-level finding fields. No existing field was changed, renamed, or removed; a consumer that ignores this field sees identical behavior to before. See §1 for the full schema and an example message with a populated `additional_findings` entry.
+* Scoped conservatively to at most one additional finding per event (not open-ended multi-issue detection), to keep this a targeted fix for the specific coexisting-issue case that was found and verified, rather than an unbounded cost/complexity increase.
+
+### Fixed: unreliable measurements from occluded joints could be reported as real findings
+* While validating `additional_findings`, found MediaPipe can report a "successful" pose detection for a frame while individual joints are essentially invisible in it (e.g. a front-on batting stance where the pads/bat occlude the knee and ankle) — it still returns *some* x/y for them (extrapolated, not observed), so a joint-angle formula silently produced a number that looked like a real measurement but was pure noise. One confirmed real case: a "front knee bent to ~7 degrees" reading — physically implausible, and visually the leg was clearly not that bent — traced to MediaPipe itself scoring that knee/ankle at 0.03/0.01 visibility.
+* `compute_metric_from_landmarks` now checks each profile's specific required joints' visibility scores before computing anything, and returns "unmeasurable" (same as a full pose-detection failure) if any of them are below a threshold calibrated against real footage (an audit of every profile across a real test video's events found a genuine, isolated near-zero cluster, then a clean gap, then a continuous and mostly-legitimate range starting around 0.11 — the threshold sits in that gap).
+* This affects every endpoint that calls pose math (`/video-analyses`, `/regression-checks`, `/pose-corrections`) — an event whose *assigned* profile depends on an occluded joint is now skipped entirely (same as today's "no pose detected" case) rather than publishing a bad measurement; an `additional_findings` entry with an occluded profile is simply omitted rather than the whole event being affected. No response field changed shape — this only changes which events/findings clear the bar to be reported at all, in favor of accuracy.
+
+### New: stricter confidence bar for higher-stakes claims, and a unified `all_findings` view
+* A second simultaneous finding (`additional_findings`) and a regression alert ("a previously-fixed habit is returning") are both bigger claims on a coach's trust than a routine flaw card, so both now require a stricter landmark-visibility bar (`HIGH_CONFIDENCE_MIN_VISIBILITY`, higher than the base bar described above) before they're surfaced at all. Below that bar, the underlying finding/measurement is still reported if it clears the base gate — it just doesn't get the second-finding or regression escalation layered on top. This applies to regression detection in both `/video-analyses` and the standalone `/regression-checks` endpoint. No field changed shape; this only changes which findings/alerts clear the bar to be shown, again in favor of accuracy over volume.
+* New field `all_findings` (§1) — `[the top-level finding] + additional_findings`, all in one flat array with the identical shape. There's no real severity ordering between the top-level finding and `additional_findings` (the model just names one profile first); that split exists only for backward compatibility with the pre-existing top-level fields. `all_findings` is the recommended way to render "N equal-weight finding cards" without writing special-case logic for "the main one vs. this other array."
